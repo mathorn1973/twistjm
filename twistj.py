@@ -88,7 +88,7 @@ def thue_morse(n: int) -> int:
     Thue-Morse bit at position n. O(1) via popcount.
     Returns 0 or 1. Canon SS15.
     """
-    return bin(n).count('1') % 2
+    return n.bit_count() & 1
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +182,62 @@ def apply_mj_power(x: torch.Tensor, n: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# CROSS-BLOCK MIXING: Thue-Morse driven channel permutation
+# ---------------------------------------------------------------------------
+#
+# Problem: M_J acts on 4-blocks independently. Features [0..3] never
+# interact with [4..7], no matter how many times you stack M_J.
+#
+# Solution: alternate between two groupings, driven by Thue-Morse.
+#
+#   TM bit 0 (Snap): apply M_J on consecutive blocks [0,1,2,3], [4,5,6,7]...
+#   TM bit 1 (Flow): roll features by 2, then apply M_J, then roll back.
+#
+# Why shift=2: J = 1 + zeta_5^2. The exponent 2 generates the Galois
+# group Gal(Q(zeta_5)/Q). Shifting by 2 within each block IS the Galois
+# action on the feature space. This is not an arbitrary choice.
+#
+# After d alternating steps, feature i has interacted with features
+# up to distance 2d away. Full mixing of dim features needs ~dim/4 steps.
+# In practice, depth=4..8 gives good coverage for dim=512.
+#
+# Canon reference: SS74 (TM-driven dynamics), SS85.5 (Reduction Theorem).
+# ---------------------------------------------------------------------------
+
+
+def apply_mj_mixed(x: torch.Tensor, depth: int, inverse: bool = False) -> torch.Tensor:
+    """
+    Apply M_J with Thue-Morse driven cross-block mixing.
+
+    At each step k:
+        if TM(k) = 0: apply M_J (or M_J^{-1}) on consecutive 4-blocks
+        if TM(k) = 1: roll by 2, apply, roll back
+
+    When inverse=True, steps are applied in REVERSE order (k = depth-1 .. 0)
+    to correctly undo the forward composition.
+
+    This breaks the 4-block isolation while using only:
+        - The same M_J kernel (5 or 6 add/sub)
+        - A fixed roll (free, just index arithmetic)
+        - The Thue-Morse sequence (1 popcount per step)
+
+    No learned parameters. No new matrices. No multiplications.
+    """
+    fn = apply_mj_inv if inverse else apply_mj
+    steps = range(depth - 1, -1, -1) if inverse else range(depth)
+    h = x
+    for k in steps:
+        tm_bit = thue_morse(k)
+        if tm_bit:
+            h = torch.roll(h, shifts=2, dims=-1)
+            h = fn(h)
+            h = torch.roll(h, shifts=-2, dims=-1)
+        else:
+            h = fn(h)
+    return h
+
+
+# ---------------------------------------------------------------------------
 # PART II: TRAINING MOTOR (BF16 / FP32)
 # ---------------------------------------------------------------------------
 
@@ -257,11 +313,11 @@ class TwistJMotor(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _validate(x, self.dim, "TwistJMotor")
 
-        out = x
-        for _ in range(self.depth):
-            out = apply_mj(out)
-            if self.normalize:
-                out = out * self._inv_phi
+        # TM-driven cross-block mixing (breaks 4-block isolation)
+        out = apply_mj_mixed(x, self.depth, inverse=False)
+
+        if self.normalize:
+            out = out * self._inv_phi.to(dtype=out.dtype)
 
         # Learned decoder
         return out * self.scale + self.bias
@@ -299,9 +355,14 @@ def quantize_rule42(x: torch.Tensor, bound: int = RULE_42) -> tuple:
     """
     Quantize float tensor to [-bound, bound] INT8.
 
+    Uses per-token scaling (along last dim) for accuracy.
+    One outlier token no longer ruins quantization for all others.
+
     Returns (x_int8, q_scale) where x approx x_int8 * q_scale.
+    q_scale has shape broadcastable to x (one scale per token).
     """
-    max_val = x.detach().abs().amax().to(torch.float32).clamp(min=1e-12)
+    # Per-token: find max along feature dim, keep other dims
+    max_val = x.detach().abs().amax(dim=-1, keepdim=True).to(torch.float32).clamp(min=1e-12)
     q_scale = max_val / float(bound)
     x_int = torch.clamp(
         torch.round(x.to(torch.float32) / q_scale),
@@ -402,8 +463,15 @@ class TwistJMotorInt8(nn.Module):
 
         for step in range(self.depth):
             x_int, q_scale = quantize_rule42(x, RULE_42)
-            y_int = apply_mj_int(x_int)
-            # Dequantize back to float for next step or final output
+            # TM-driven mixing: same pattern as training motor
+            tm_bit = thue_morse(step)
+            if tm_bit:
+                x_int = torch.roll(x_int, shifts=2, dims=-1)
+                y_int = apply_mj_int(x_int)
+                y_int = torch.roll(y_int, shifts=-2, dims=-1)
+            else:
+                y_int = apply_mj_int(x_int)
+            # Dequantize (q_scale broadcasts per-token)
             x = (y_int.to(torch.float32) * q_scale).to(original_dtype)
 
         return x * self.scale.to(dtype=original_dtype) + self.bias.to(dtype=original_dtype)
@@ -465,19 +533,16 @@ class TwistJFeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _validate(x, self.dim, "TwistJFeedForward")
 
-        # Forward J: expand into spectrally separated space
-        h = x
-        for _ in range(self.depth):
-            h = apply_mj(h)
+        # Forward J with TM-driven cross-block mixing
+        h = apply_mj_mixed(x, self.depth, inverse=False)
         h = h * self.scale_pre + self.bias_pre
 
         # Nonlinearity in the J-expanded space
         h = self.act(h)
         h = self.dropout(h)
 
-        # Inverse J: contract back
-        for _ in range(self.depth):
-            h = apply_mj_inv(h)
+        # Inverse J with TM-driven mixing (exact structural inverse)
+        h = apply_mj_mixed(h, self.depth, inverse=True)
         h = h * self.scale_post + self.bias_post
 
         return h
@@ -572,6 +637,31 @@ if __name__ == "__main__":
     x_back = apply_mj_power(apply_mj_power(x, 5), -5)
     power_err = (x - x_back).abs().max().item()
     print(f"[OK] M_J^5 * M_J^{{-5}} roundtrip error: {power_err:.2e}")
+
+    # 2b. TM-mixed forward/inverse identity
+    # Tolerance scales with depth: condition number grows as phi^(2d).
+    # Float32 eps ~ 1.2e-7, so roundtrip error ~ phi^(2d) * eps.
+    PHI_APPROX = FIB_47 / FIB_46
+    x_wide = torch.randn(1, 32)  # 8 blocks of 4
+    for d in [1, 2, 4, 8]:
+        fwd = apply_mj_mixed(x_wide, depth=d, inverse=False)
+        back = apply_mj_mixed(fwd, depth=d, inverse=True)
+        mix_err = (x_wide - back).abs().max().item()
+        tol = 1e-5 * PHI_APPROX ** (2 * d)
+        assert mix_err < tol, f"Mixed roundtrip failed at depth {d}: {mix_err} > {tol}"
+        print(f"     depth={d}: error={mix_err:.2e}, tolerance={tol:.2e}")
+    print(f"[OK] TM-mixed forward/inverse roundtrip (depths 1,2,4,8)")
+
+    # 2c. Cross-block mixing verification
+    # Check that after mixing, block [0..3] has influenced block [4..7]
+    x_probe = torch.zeros(1, 16)  # 4 blocks of 4
+    x_probe[0, 0] = 1.0  # energy only in block 0
+    mixed = apply_mj_mixed(x_probe, depth=4)
+    block_energies = [mixed[0, i*4:(i+1)*4].abs().sum().item() for i in range(4)]
+    nonzero_blocks = sum(1 for e in block_energies if e > 1e-10)
+    assert nonzero_blocks > 1, f"No cross-block mixing: only {nonzero_blocks} blocks active"
+    print(f"[OK] Cross-block mixing: energy spread to {nonzero_blocks}/4 blocks"
+          f" (energies: {[f'{e:.3f}' for e in block_energies]})")
 
     # 3. Training motor
     print("\n--- Training Motor ---")
